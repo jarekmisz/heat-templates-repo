@@ -1,0 +1,148 @@
+heat_template_version: 2013-05-23
+description: Web App Pattern
+parameters:
+  key_name:
+    type: string
+  flavor:
+    type: string
+  image:
+    type: string
+  chef_server_url:
+    type: string
+  nameserver:
+    type: string   
+  private_net_id:
+    type: string
+    description: ID of private network into which servers get deployed
+  private_subnet_id:
+    type: string
+    description: ID of private sub network into which servers get deployed
+  public_net_id:
+    type: string
+    description: >
+      ID of public network for which floating IP addresses will be allocated
+resources:
+
+  db2_server:
+    type: db2_server.yaml
+    properties:
+      flavor: {get_param: flavor}
+      image: {get_param: image}
+      key_name: {get_param: key_name}
+      nameserver: { get_param: nameserver }
+      chef_server_url: { get_param: chef_server_url }
+
+  wlp_server_group:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 1
+      desired_capacity: 2
+      max_size: 10
+      resource:
+        type: lb_wlp_server.yaml
+        properties:
+          flavor: {get_param: flavor}
+          image: {get_param: image}
+          key_name: {get_param: key_name}
+          pool_id: {get_resource: pool}
+          metadata: {"metering.stack": {get_param: "OS::stack_id"}}
+          db2_server_name: { get_attr: [ db2_server, db2_server_name] }
+          scheduler_hints: {group_policy: {get_resource: policy_group_RLPNF}}
+          nameserver: { get_param: nameserver }
+          chef_server_url: { get_param: chef_server_url }
+  
+  policy_group_RLPNF:
+    type: IBM::Policy::Group
+    properties:
+      policies:
+        - type: ResourceLostPerNodeFailure
+          mode: hard
+          topology:
+            name: Availability-zone
+            level: availability-zone
+            percentage: 50
+        - type: Anti-affinity
+          mode: hard
+          topology:
+            name: Availability-zone
+            level: host
+  
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: wlp_server_group}
+      cooldown: 60
+      scaling_adjustment: 1
+  web_server_scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: wlp_server_group}
+      cooldown: 60
+      scaling_adjustment: -1
+  cpu_alarm_high:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-up if the average CPU > 50% for 1 minute
+      meter_name: cpu_util
+      statistic: avg
+      period: 60
+      evaluation_periods: 1
+      threshold: 50
+      alarm_actions:
+        - {get_attr: [web_server_scaleup_policy, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
+      comparison_operator: gt
+  cpu_alarm_low:
+    type: OS::Ceilometer::Alarm
+    properties:
+      description: Scale-down if the average CPU < 15% for 10 minutes
+      meter_name: cpu_util
+      statistic: avg
+      period: 600
+      evaluation_periods: 1
+      threshold: 15
+      alarm_actions:
+        - {get_attr: [web_server_scaledown_policy, alarm_url]}
+      matching_metadata: {'metadata.user_metadata.stack': {get_param: "OS::stack_id"}}
+      comparison_operator: lt
+  monitor:
+    type: OS::Neutron::HealthMonitor
+    properties:
+      type: TCP
+      delay: 10
+      max_retries: 5
+      timeout: 5
+  pool:
+    type: OS::Neutron::Pool
+    properties:
+      protocol: HTTP
+      monitors: [{get_resource: monitor}]
+      subnet_id: {get_param: private_subnet_id}
+      lb_method: ROUND_ROBIN
+      vip:
+        protocol_port: 9080
+  lb:
+    type: OS::Neutron::LoadBalancer
+    properties:
+      protocol_port: 9080
+      pool_id: {get_resource: pool}
+
+  lb_floating:
+    type: "OS::Neutron::FloatingIP"
+    properties:
+      floating_network_id: {get_param: public_net_id}
+      port_id: {get_attr: [pool, vip, port_id]}
+
+outputs:
+  website_url:
+    value:
+      str_replace:
+        template: http://host:9080/WebCustomerCredit/
+        params:
+          host: { get_attr: [lb_floating, floating_ip_address] }
+    description: >
+      This URL is the "external" URL that can be used to access the
+      Wordpress site.
+

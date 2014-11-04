@@ -1,0 +1,217 @@
+heat_template_version: 2013-05-23
+description: A load-balancer server
+parameters:
+  flavor:
+    type: string
+    description: flavor used by the servers
+  image:
+    type: string
+    description: Image used for servers
+  key_name:
+    type: string
+    description: SSH key to connect to the servers
+  pool_id:
+    type: string
+    description: Pool to contact
+  metadata:
+    type: json
+  scheduler_hints: 
+    type: json
+  chef_server_url:
+    type: string
+  nameserver:
+    type: string    
+  db2_server_name:
+    type: string
+
+resources:
+  wlp_server:
+    type: OS::Nova::Server
+    properties:
+      flavor: {get_param: flavor}
+      image: {get_param: image}
+      key_name: {get_param: key_name}
+      metadata: {get_param: metadata}
+      scheduler_hints: {get_param: scheduler_hints}
+      user_data_format: SOFTWARE_CONFIG
+  member:
+    type: OS::Neutron::PoolMember
+    properties:
+      pool_id: {get_param: pool_id}
+      address: {get_attr: [wlp_server, first_address]}
+      protocol_port: 9080
+
+  wlp_config:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      inputs:
+      - name: DB2SERVERNAME
+        default: '192.168.1.1'
+      group: script
+      config:
+        str_replace:
+          template: |
+            #!/bin/bash
+            export intfc=eth0
+            export IP=`ifconfig $intfc | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}'`
+            export HOSTNAME=`hostname`
+            export DOMAIN=mgt
+            export NAMESERVER=%nameserver%
+             #save stdout and stderr to file descriptors 3 and 4, then redirect them to "config.log"
+            exec 3>&1 4>&2 >wlp_config.log 2>&1
+            #Fix the etc/hosts file
+            tee -a /etc/hosts <<EOF
+            $IP $HOSTNAME $HOSTNAME.$DOMAIN
+            EOF
+
+            #Fix the DNS
+            tee /etc/resolv.conf <<EOF
+            search $DOMAIN
+            nameserver $NAMESERVER
+            EOF
+
+            #Fix sshd to allow password access. The service will be restarted in the recipe.
+            sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+            service sshd restart
+
+ 
+            #install chef client
+            curl -L https://www.getchef.com/chef/install.sh | bash
+
+            #Set up the chef environment
+            mkdir -p /etc/chef
+
+            tee /etc/chef/client.rb <<EOF
+            log_location     STDOUT
+            chef_server_url  "https://%chef_server_url%:443"
+            validation_client_name "chef-validator"
+            #Using default node name (fqdn)
+            EOF
+
+            tee /etc/chef/validation.pem <<EOF
+            -----BEGIN RSA PRIVATE KEY-----
+            #Insert the key for your chef server 
+            -----END RSA PRIVATE KEY-----
+            EOF
+
+            #Get the db2 jdbc driver
+            mkdir -p /opt/db2/java
+            wget http://%chef_server_url%/repos/install_images/db2/jcc/db2jcc4.jar
+            wget http://%chef_server_url%/repos/install_images/db2/jcc/db2jcc_license_cu.jar
+            mv *.jar /opt/db2/java
+
+            # Liberty Profile
+            tee defaultServer.json <<EOF
+            {
+              "wlp": {
+                "servers": {
+                  "defaultServer": {
+                    "enabled": true,
+                    "serverName": "defaultServer",
+                    "description": "Default Server",
+                    "featureManager": {
+                      "feature": ["jsp-2.2", "jdbc-4.0", "jpa-2.0", "adminCenter-1.0"]
+                    },
+                    "httpEndpoint": {
+                      "id": "defaultHttpEndpoint",
+                      "host": "*",
+                      "httpPort": "9080",
+                      "httpsPort": "9443"
+                    },
+                    "quickStartSecurity": {
+                      "userName": "admin",
+                      "userPassword": "admin"
+                    },
+                    "keyStore": {
+                      "id": "defaultKeyStore",
+                      "password": "Liberty"
+                    },
+                    "library": {
+                      "id": "DBLib",
+                      "fileset": {
+                        "dir": "/opt/db2/java",
+                        "includes": "db2jcc4.jar db2jcc_license_cisuz.jar"
+                      }
+                    },
+                    "dataSource": {
+                      "id": "db",
+                      "jndiName": "jdbc/db",
+                      "connectionSharing": "MatchCurrentState",
+                      "isolationLevel": "TRANSACTION_READ_COMMITTED",
+                      "jdbcDriver": {
+                        "libraryRef": "DBLib"
+                      },
+                      "properties.db2.jcc": {
+                        "databaseName": "SAMPLE",
+                        "serverName": "$DB2SERVERNAME",
+                        "portNumber": "50000",
+                        "currentLockTimeout": "30s",
+                        "user": "db2inst1",
+                        "password": "passw0rd"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            EOF
+
+            #Install Websphere Liberty Profile
+            chef-client -r "recipe[wlp]","recipe[wlp::serverconfig]" -j defaultServer.json
+            #restore stdout and stderr
+            exec 1>&3 2>&4
+            echo "defaultServer"
+          params:
+            "%nameserver%" : { get_param: nameserver }
+            "%chef_server_url%" : { get_param: chef_server_url}
+  wlp_deployment:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: wlp_config
+      server:
+        get_resource: wlp_server
+      input_values:
+        DB2SERVERNAME: { get_param: db2_server_name }
+
+  wcc_config:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      inputs:
+      - name: WLPSERVER
+      group: script
+      config: 
+        str_replace:
+          template: |
+            #!/bin/bash
+            #exec 3>&1 4>&2 >wcc_config.log 2>&1
+            set -x
+            #Remove trailing line feed using command substitution
+            export WLPSERVER=$(echo "$WLPSERVER")
+            export DROPINS="/opt/was/liberty/wlp/usr/servers/$WLPSERVER/dropins"
+            if [ ! -d "$DROPINS" ]; then
+             mkdir -p $DROPINS
+             echo "dropins directory created..."
+            fi
+            echo $DROPINS
+            cd $DROPINS
+            wget http://%chef_server_url%/repos/applications/WebCustomerCredit/WebCustomerCredit.war
+            bash -c "/opt/was/liberty/wlp/bin/server start $WLPSERVER"
+            set +x
+            #restore stdout and stderr
+            #exec 1>&3 2>&4
+          params:
+            "%chef_server_url%" : { get_param: chef_server_url}
+
+
+  wcc_deployment:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: wlp_deployment
+    properties:
+      config:
+        get_resource: wcc_config
+      server:
+        get_resource: wlp_server
+      input_values:
+        WLPSERVER: { get_attr: [wlp_deployment, deploy_stdout] }
+
